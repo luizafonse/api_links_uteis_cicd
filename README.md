@@ -362,4 +362,214 @@ Agora que os testes estão automatizados, vamos adicionar o Job de CD para empac
 
 </details>
 
-Testando CD não deveria rodar no pull request
+<details>
+<summary><strong>Parte 7: Containerização com Docker e Deploy Automático</strong></summary>
+
+Vamos agora containerizar nossa aplicação usando Docker e automatizar o deploy. Isso permitirá que a aplicação seja executada em qualquer ambiente de forma consistente.
+
+### 7.1 - Entendendo o Dockerfile
+
+O projeto já possui um `Dockerfile` na raiz. Vamos entender como ele funciona:
+
+```dockerfile
+# Usa imagem Maven para compilar o projeto
+FROM maven:3.9.9-eclipse-temurin-21 AS build
+
+# Define pasta de trabalho dentro do container
+WORKDIR /app
+
+# Copia todo o código para dentro do container
+COPY . .
+
+# Compila e gera o JAR (pula testes para acelerar)
+RUN mvn clean package -DskipTests
+
+# === STAGE 2: RUNTIME ===
+# Nova etapa, usa apenas o Java Runtime (mais leve que Maven)
+FROM eclipse-temurin:21-jre
+
+# Define pasta de trabalho
+WORKDIR /app
+
+# Copia o JAR gerado na etapa anterior
+COPY --from=build /app/target/*.jar app.jar
+
+# Informa que a aplicação usa a porta 8080
+EXPOSE 8080
+
+# Comando para rodar a aplicação
+ENTRYPOINT ["java", "-jar", "app.jar"]
+```
+
+**O que é Multi-Stage Build?**
+
+  - **Stage 1 (build)**: Usa Maven para compilar o projeto e gerar o `.jar`
+  - **Stage 2 (runtime)**: Copia apenas o `.jar` para uma imagem mais leve com Java Runtime
+  - **Vantagem**: A imagem final é muito menor, pois não inclui o Maven e dependências de build
+
+### 7.2 - Configurando o GitHub Actions para Docker
+
+O projeto já possui o arquivo `.github/workflows/docker-deploy.yml` configurado. Vamos entender como funciona:
+
+```yaml
+# Nome do workflow que aparece no GitHub
+name: Docker Build & Deploy
+
+# Quando executar este workflow
+on:
+    push:
+        branches: ["main"]  # Executa quando houver push na branch main
+    workflow_dispatch:      # Permite executar manualmente pelo GitHub
+
+# Lista de trabalhos (jobs)
+jobs:
+  # Job 1: Executar testes
+  test:
+    runs-on: ubuntu-latest
+    # Usa container Maven para rodar os testes
+    container:
+        image: maven:3.9.9-eclipse-temurin-21
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      # Executa testes unitários e de integração
+      - name: Executar testes no container
+        run: mvn -B verify
+
+  # Job 2: Build da imagem Docker e Deploy
+  build-and-deploy:
+    # Só executa se os testes passarem
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      # Faz login no Docker Hub usando secrets configurados
+      - name: Login no Docker Hub
+        uses: docker/login-action@v3
+        with: 
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # Constrói a imagem Docker e envia para o Docker Hub
+      - name: Build e Push para Docker Hub
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ secrets.DOCKER_USERNAME }}/api-links-uteis:latest
+
+      # Aciona o webhook do Render para fazer deploy automático
+      - name: Deploy no Render
+        run: curl -X POST ${{ secrets.RENDER_DEPLOY_HOOK }}
+```
+
+**Entendendo o fluxo:**
+
+1.  **test**: Executa todos os testes dentro de um container Maven
+2.  **build-and-deploy**: Só roda se os testes passarem
+      * Faz login no Docker Hub
+      * Constrói a imagem Docker usando o Dockerfile
+      * Envia a imagem para o Docker Hub
+      * Notifica o Render para fazer deploy da nova versão
+
+### 7.3 - Configuração Passo a Passo
+
+**Etapas:**
+
+1.  **Criar conta no Docker Hub**
+
+      * Acesse [Docker Hub](https://hub.docker.com)
+      * Clique em **"Sign Up"** e crie sua conta
+      * Confirme seu e-mail
+
+2.  **Criar Access Token no Docker Hub**
+
+      * Faça login no Docker Hub
+      * Clique no seu usuário (canto superior direito) → **Account Settings**
+      * Vá em **Security** → **New Access Token**
+      * Preencha:
+          * **Description**: `github-actions-api-links`
+          * **Access permissions**: **Read, Write, Delete**
+      * Clique em **Generate**
+      * **⚠️ COPIE O TOKEN** (você só verá uma vez\!)
+
+3.  **Configurar Secrets no GitHub**
+
+      * Vá para seu repositório no GitHub
+      * Clique em **Settings** → **Secrets and variables** → **Actions**
+      * Clique em **"New repository secret"** e adicione **3 secrets**:
+          * **DOCKER\_USERNAME**
+              * **Name**: `DOCKER_USERNAME`
+              * **Secret**: Seu username do Docker Hub (ex: `seunome`)
+          * **DOCKER\_PASSWORD**
+              * **Name**: `DOCKER_PASSWORD`
+              * **Secret**: Cole o token gerado no passo 2
+          * **RENDER\_DEPLOY\_HOOK** (configurar após criar serviço no Render)
+              * **Name**: `RENDER_DEPLOY_HOOK`
+              * **Secret**: URL do webhook do Render (veremos no passo 4)
+
+4.  **Configurar Deploy no Render**
+
+      * Acesse [Render](https://render.com) e faça login (pode usar GitHub)
+      * Clique em **"New +"** → **"Web Service"**
+      * Escolha **"Deploy an existing image from a registry"**
+      * Configure:
+          * **Image URL**: `docker.io/SEU-USERNAME/api-links-uteis:latest`
+          * **Name**: `api-links-uteis`
+          * **Region**: escolha a mais próxima (ex: Oregon/Ohio)
+          * **Instance Type**: **Free** (para testes)
+      * Em **Environment Variables**, adicione (se necessário):
+          * `JAVA_OPTS`: `-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0`
+      * Clique em **"Create Web Service"**
+
+5.  **Obter Deploy Hook do Render**
+
+      * No dashboard do Render, vá no seu serviço criado
+      * Clique em **Settings**
+      * Role até **Deploy Hook**
+      * Copie a URL do webhook
+      * Adicione no GitHub Secrets como `RENDER_DEPLOY_HOOK` (conforme passo 3)
+
+6.  **Testar o Pipeline Completo**
+
+      * Faça uma mudança no código (ex: alterar mensagem em `HelloController`)
+      * Commit e push para a branch `main`:
+
+    <!-- end list -->
+
+    ```powershell
+    git add .
+    git commit -m "test: trigger docker pipeline"
+    git push origin main
+    ```
+
+      * Vá para **Actions** no GitHub
+      * Acompanhe o workflow **"Docker Build & Deploy"**
+      * Após conclusão:
+          * Verifique a imagem no Docker Hub
+          * Aguarde alguns minutos e acesse sua aplicação no Render
+
+### 7.4 - Como funciona o pipeline?
+
+```
+Push na main
+    ↓
+Job 1: Test (executar testes com Maven)
+    ↓
+Job 2: Build and Deploy
+    ├─ Build da imagem Docker
+    ├─ Push para Docker Hub
+    └─ Trigger deploy no Render
+    ↓
+Render baixa nova imagem e faz deploy
+```
+
+**O que cada job faz?**
+
+  - **test**: Garante que o código está funcionando antes de criar a imagem
+  - **build-and-deploy**: Cria a imagem Docker, envia para o Docker Hub e notifica o Render para fazer o deploy
+
+</details>
